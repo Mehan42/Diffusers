@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -86,6 +86,20 @@ class CogVideoXBlock(nn.Module):
         attention_out_bias: bool = True,
     ):
         super().__init__()
+        self.dim = dim
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
+        self.time_embed_dim = time_embed_dim
+        self.dropout = dropout
+        self.activation_fn = activation_fn
+        self.attention_bias = attention_bias
+        self.qk_norm = qk_norm
+        self.norm_elementwise_affine = norm_elementwise_affine
+        self.norm_eps = norm_eps
+        self.final_dropout = final_dropout
+        self.ff_inner_dim = ff_inner_dim
+        self.ff_bias = ff_bias
+        self.attention_out_bias = attention_out_bias
 
         # 1. Self Attention
         self.norm1 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
@@ -119,6 +133,7 @@ class CogVideoXBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_frames: int = None,
     ) -> torch.Tensor:
         text_seq_length = encoder_hidden_states.size(1)
 
@@ -148,6 +163,410 @@ class CogVideoXBlock(nn.Module):
 
         hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
         encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+
+        return hidden_states, encoder_hidden_states
+
+
+# norm_final is just nn.LayerNorm, all ops will be on channel dimension, so we dont have to care about frame dimension
+# proj_out is also just along channel dimension
+# norm_out is just linear and nn.LayerNorm, again only on channel dimension, so we dont care about frame dims
+# same story with norm1, norm2 and ff
+# patch embed layer just applies on channel dim too and condenses to [B, FHW, C]
+# only attention layer seems to be actually doing anything with the frame dimension and so only location where FreeNoise needs to be applied
+# Since it does not matter for norm1, norm2, ff, and they might create memory bottleneck, just use FreeNoise frame split on them too
+
+
+@maybe_allow_in_graph
+class FreeNoiseCogVideoXBlock(nn.Module):
+    r"""
+    FreeNoise block used in [CogVideoX](https://github.com/THUDM/CogVideo) model.
+
+    Parameters:
+        dim (`int`):
+            The number of channels in the input and output.
+        num_attention_heads (`int`):
+            The number of heads to use for multi-head attention.
+        attention_head_dim (`int`):
+            The number of channels in each head.
+        time_embed_dim (`int`):
+            The number of channels in timestep embedding.
+        dropout (`float`, defaults to `0.0`):
+            The dropout probability to use.
+        activation_fn (`str`, defaults to `"gelu-approximate"`):
+            Activation function to be used in feed-forward.
+        attention_bias (`bool`, defaults to `False`):
+            Whether or not to use bias in attention projection layers.
+        qk_norm (`bool`, defaults to `True`):
+            Whether or not to use normalization after query and key projections in Attention.
+        norm_elementwise_affine (`bool`, defaults to `True`):
+            Whether to use learnable elementwise affine parameters for normalization.
+        norm_eps (`float`, defaults to `1e-5`):
+            Epsilon value for normalization layers.
+        final_dropout (`bool` defaults to `False`):
+            Whether to apply a final dropout after the last feed-forward layer.
+        ff_inner_dim (`int`, *optional*, defaults to `None`):
+            Custom hidden dimension of Feed-forward layer. If not provided, `4 * dim` is used.
+        ff_bias (`bool`, defaults to `True`):
+            Whether or not to use bias in Feed-forward layer.
+        attention_out_bias (`bool`, defaults to `True`):
+            Whether or not to use bias in Attention output projection layer.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+        context_length: int = 16,
+        context_stride: int = 4,
+        weighting_scheme: str = "pyramid",
+        prompt_interpolation_callback: Callable[[int, int, torch.Tensor, torch.Tensor], torch.Tensor] = None,
+        prompt_pooling_callback: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_attention_heads = num_attention_heads
+        self.attention_head_dim = attention_head_dim
+        self.time_embed_dim = time_embed_dim
+        self.dropout = dropout
+        self.activation_fn = activation_fn
+        self.attention_bias = attention_bias
+        self.qk_norm = qk_norm
+        self.norm_elementwise_affine = norm_elementwise_affine
+        self.norm_eps = norm_eps
+        self.final_dropout = final_dropout
+        self.ff_inner_dim = ff_inner_dim
+        self.ff_bias = ff_bias
+        self.attention_out_bias = attention_out_bias
+
+        self.set_free_noise_properties(
+            context_length, context_stride, weighting_scheme, prompt_interpolation_callback, prompt_pooling_callback
+        )
+
+        # 1. Self Attention
+        self.norm1 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        # 2. Feed Forward
+        self.norm2 = CogVideoXLayerNormZero(time_embed_dim, dim, norm_elementwise_affine, norm_eps, bias=True)
+
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+    # Copied from diffusers.models.attention.FreeNoiseTransformerBlock.set_free_noise_properties
+    def set_free_noise_properties(
+        self,
+        context_length: int,
+        context_stride: int,
+        weighting_scheme: str = "pyramid",
+        prompt_interpolation_callback: Callable[[int, int, torch.Tensor, torch.Tensor], torch.Tensor] = None,
+        prompt_pooling_callback: Callable[[List[torch.Tensor]], torch.Tensor] = None,
+    ) -> None:
+        if prompt_interpolation_callback is None:
+            raise ValueError("Must pass a callback to interpolate between prompt embeddings.")
+        if prompt_pooling_callback is None:
+            raise ValueError("Must pass a callback to pool prompt embeddings.")
+        self.context_length = context_length
+        self.context_stride = context_stride
+        self.weighting_scheme = weighting_scheme
+        self.prompt_interpolation_callback = prompt_interpolation_callback
+        self.prompt_pooling_callback = prompt_pooling_callback
+
+    # Copied from diffusers.models.attention.FreeNoiseTransformerBlock._get_frame_indices
+    def _get_frame_indices(self, num_frames: int) -> List[Tuple[int, int]]:
+        frame_indices = []
+        for i in range(0, num_frames - self.context_length + 1, self.context_stride):
+            window_start = i
+            window_end = min(num_frames, i + self.context_length)
+            frame_indices.append((window_start, window_end))
+        return frame_indices
+
+    # Copied from diffusers.models.attention.FreeNoiseTransformerBlock._get_frame_weights
+    def _get_frame_weights(self, num_frames: int, weighting_scheme: str = "pyramid") -> List[float]:
+        if weighting_scheme == "flat":
+            weights = [1.0] * num_frames
+
+        elif weighting_scheme == "pyramid":
+            if num_frames % 2 == 0:
+                # num_frames = 4 => [1, 2, 2, 1]
+                mid = num_frames // 2
+                weights = list(range(1, mid + 1))
+                weights = weights + weights[::-1]
+            else:
+                # num_frames = 5 => [1, 2, 3, 2, 1]
+                mid = (num_frames + 1) // 2
+                weights = list(range(1, mid))
+                weights = weights + [mid] + weights[::-1]
+
+        elif weighting_scheme == "delayed_reverse_sawtooth":
+            if num_frames % 2 == 0:
+                # num_frames = 4 => [0.01, 2, 2, 1]
+                mid = num_frames // 2
+                weights = [0.01] * (mid - 1) + [mid]
+                weights = weights + list(range(mid, 0, -1))
+            else:
+                # num_frames = 5 => [0.01, 0.01, 3, 2, 1]
+                mid = (num_frames + 1) // 2
+                weights = [0.01] * mid
+                weights = weights + list(range(mid, 0, -1))
+        else:
+            raise ValueError(f"Unsupported value for weighting_scheme={weighting_scheme}")
+
+        return weights
+
+    def _prepare_free_noise_encoder_hidden_states(
+        self,
+        encoder_hidden_states: Union[
+            torch.Tensor, List[torch.Tensor], Tuple[Dict[int, torch.Tensor], Optional[Dict[int, torch.Tensor]]]
+        ],
+        frame_indices: List[int],
+    ) -> List[torch.Tensor]:
+        if torch.is_tensor(encoder_hidden_states):
+            encoder_hidden_states = [encoder_hidden_states.clone() for _ in range(len(frame_indices))]
+
+        elif isinstance(encoder_hidden_states, tuple):
+            print("frame_indices:", frame_indices)
+            pooled_prompt_embeds_list = []
+            pooled_negative_prompt_embeds_list = []
+            negative_prompt_embeds_dict, prompt_embeds_dict = encoder_hidden_states
+            last_frame_start = 0
+
+            # For every batch of frames that is to be processed, pool the positive and negative prompt embeddings.
+            # TODO(aryan): Since this is experimental, I didn't try many different things. I found from testing
+            # that pooling with previous batch frame embeddings necessary to produce better results and help with
+            # prompt transitions.
+            for frame_start, frame_end in frame_indices:
+                pooled_prompt_embeds = None
+                pooled_negative_prompt_embeds = None
+
+                pooling_list = [
+                    prompt_embeds_dict[i] for i in range(last_frame_start, frame_end) if i in prompt_embeds_dict
+                ]
+                if len(pooling_list) > 0:
+                    print("pooling", [i for i in range(last_frame_start, frame_end) if i in prompt_embeds_dict])
+                    pooled_prompt_embeds = self.prompt_pooling_callback(pooling_list)
+                    print("after pooling:", pooled_prompt_embeds.isnan().any())
+
+                if negative_prompt_embeds_dict is not None:
+                    pooling_list = [
+                        negative_prompt_embeds_dict[i]
+                        for i in range(last_frame_start, frame_end)
+                        if i in negative_prompt_embeds_dict
+                    ]
+                    if len(pooling_list) > 0:
+                        print(
+                            "negative pooling", [i for i in range(last_frame_start, frame_end) if i in prompt_embeds_dict]
+                        )
+                        pooled_negative_prompt_embeds = self.prompt_pooling_callback(pooling_list)
+                        print("after negative pooling:", pooled_negative_prompt_embeds.isnan().any())
+
+                pooled_prompt_embeds_list.append(pooled_prompt_embeds)
+                pooled_negative_prompt_embeds_list.append(pooled_negative_prompt_embeds)
+                last_frame_start = frame_start
+
+            assert pooled_prompt_embeds_list[0] is not None
+            assert pooled_prompt_embeds[-1] is not None
+            if negative_prompt_embeds_dict is not None:
+                assert pooled_negative_prompt_embeds_list[0] is not None
+                assert pooled_negative_prompt_embeds_list[-1] is not None
+
+            # If there were no relevant prompts for certain frame batches, interpolate and fill in the gaps
+            last_existent_embed_index = 0
+            for i in range(1, len(frame_indices)):
+                if pooled_prompt_embeds_list[i] is not None and i - last_existent_embed_index > 1:
+                    print("interpolating:", last_existent_embed_index, i)
+                    interpolated_embeds = self.prompt_interpolation_callback(
+                        last_existent_embed_index,
+                        i,
+                        pooled_prompt_embeds_list[last_existent_embed_index],
+                        pooled_prompt_embeds_list[i],
+                    )
+                    print("after interpolating", interpolated_embeds.isnan().any())
+                    pooled_prompt_embeds_list[last_existent_embed_index : i + 1] = interpolated_embeds.split(1, dim=0)
+                    last_existent_embed_index = i
+            assert all(x is not None for x in pooled_prompt_embeds_list)
+
+            if negative_prompt_embeds_dict is not None:
+                last_existent_embed_index = 0
+                for i in range(1, len(frame_indices)):
+                    if pooled_negative_prompt_embeds_list[i] is not None and i - last_existent_embed_index > 1:
+                        print("negative interpolating:", last_existent_embed_index, i)
+                        interpolated_embeds = self.prompt_interpolation_callback(
+                            last_existent_embed_index,
+                            i,
+                            pooled_negative_prompt_embeds_list[last_existent_embed_index],
+                            pooled_negative_prompt_embeds_list[i],
+                        )
+                        print("after negative interpolating", interpolated_embeds.isnan().any())
+                        pooled_negative_prompt_embeds_list[
+                            last_existent_embed_index : i + 1
+                        ] = interpolated_embeds.split(1, dim=0)
+                        last_existent_embed_index = i
+                assert all(x is not None for x in pooled_negative_prompt_embeds_list)
+
+            if negative_prompt_embeds_dict is not None:
+                # Classifier-Free Guidance
+                pooled_prompt_embeds_list = [
+                    torch.cat([negative_prompt_embeds, prompt_embeds])
+                    for negative_prompt_embeds, prompt_embeds in zip(
+                        pooled_negative_prompt_embeds_list, pooled_prompt_embeds_list
+                    )
+                ]
+
+            encoder_hidden_states = pooled_prompt_embeds_list
+
+        elif not isinstance(encoder_hidden_states, list):
+            raise ValueError(
+                f"Expected `encoder_hidden_states` to be a tensor, list of tensor, or a tuple of dictionaries, but found {type(encoder_hidden_states)=}"
+            )
+
+        assert isinstance(encoder_hidden_states, list) and len(encoder_hidden_states) == len(frame_indices)
+        return encoder_hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_frames: int = None,
+    ) -> torch.Tensor:
+        # hidden_states: [B, F x H x W, C]
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        frame_indices = self._get_frame_indices(num_frames)
+        frame_weights = self._get_frame_weights(self.context_length, self.weighting_scheme)
+        frame_weights = (
+            torch.tensor(frame_weights, device=device, dtype=dtype).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+        )
+        is_last_frame_batch_complete = frame_indices[-1][1] == num_frames
+
+        # Handle out-of-bounds case if num_frames isn't perfectly divisible by context_length
+        # For example, num_frames=25, context_length=16, context_stride=4, then we expect the ranges:
+        #    [(0, 16), (4, 20), (8, 24), (10, 26)]
+        if not is_last_frame_batch_complete:
+            if num_frames < self.context_length:
+                raise ValueError(f"Expected {num_frames=} to be greater or equal than {self.context_length=}")
+            last_frame_batch_length = num_frames - frame_indices[-1][1]
+            frame_indices.append((num_frames - self.context_length, num_frames))
+
+        # Unflatten frame dimension: [B, F, HW, C]
+        batch_size, frames_height_width, channels = hidden_states.shape
+        hidden_states = hidden_states.reshape(batch_size, num_frames, frames_height_width // num_frames, channels)
+        encoder_hidden_states = self._prepare_free_noise_encoder_hidden_states(encoder_hidden_states, frame_indices)
+
+        num_times_accumulated = torch.zeros((1, num_frames, 1, 1), device=device)
+        accumulated_values = torch.zeros_like(hidden_states)
+
+        text_seq_length = _get_text_seq_length(encoder_hidden_states)
+
+        for i, (frame_start, frame_end) in enumerate(frame_indices):
+            # The reason for slicing here is to handle cases like frame_indices=[(0, 16), (16, 20)],
+            # if the user provided a video with 19 frames, or essentially a non-multiple of `context_length`.
+            weights = torch.ones_like(num_times_accumulated[:, frame_start:frame_end])
+            weights *= frame_weights
+
+            # Flatten frame dimension: [B, F'HW, C]
+            hidden_states_chunk = hidden_states[:, frame_start:frame_end].flatten(1, 2)
+            print(
+                "debug:",
+                text_seq_length,
+                torch.isnan(hidden_states_chunk).any(),
+                torch.isnan(encoder_hidden_states[i]).any(),
+            )
+
+            # norm & modulate
+            norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
+                hidden_states_chunk, encoder_hidden_states[i], temb
+            )
+
+            # attention
+            attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                image_rotary_emb=image_rotary_emb,
+            )
+
+            hidden_states_chunk = hidden_states_chunk + gate_msa * attn_hidden_states
+            encoder_hidden_states[i] = encoder_hidden_states[i] + enc_gate_msa * attn_encoder_hidden_states
+
+            # norm & modulate
+            norm_hidden_states, norm_encoder_hidden_states, gate_ff, enc_gate_ff = self.norm2(
+                hidden_states_chunk, encoder_hidden_states[i], temb
+            )
+
+            # feed-forward
+            norm_hidden_states = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+            ff_output = self.ff(norm_hidden_states)
+
+            hidden_states_chunk = hidden_states_chunk + gate_ff * ff_output[:, text_seq_length:]
+            encoder_hidden_states[i] = encoder_hidden_states[i] + enc_gate_ff * ff_output[:, :text_seq_length]
+
+            # Unflatten frame dimension: [B, F', HW, C]
+            _num_frames = frame_end - frame_start
+            hidden_states_chunk = hidden_states_chunk.reshape(batch_size, _num_frames, -1, channels)
+
+            if i == len(frame_indices) - 1 and not is_last_frame_batch_complete:
+                accumulated_values[:, -last_frame_batch_length:] += (
+                    hidden_states_chunk[:, -last_frame_batch_length:] * weights[:, -last_frame_batch_length:]
+                )
+                num_times_accumulated[:, -last_frame_batch_length:] += weights[:, -last_frame_batch_length]
+            else:
+                accumulated_values[:, frame_start:frame_end] += hidden_states_chunk * weights
+                num_times_accumulated[:, frame_start:frame_end] += weights
+
+        # TODO(aryan): Maybe this could be done in a better way.
+        #
+        # Previously, this was:
+        # hidden_states = torch.where(
+        #    num_times_accumulated > 0, accumulated_values / num_times_accumulated, accumulated_values
+        # )
+        #
+        # The reasoning for the change here is `torch.where` became a bottleneck at some point when golfing memory
+        # spikes. It is particularly noticeable when the number of frames is high. My understanding is that this comes
+        # from tensors being copied - which is why we resort to spliting and concatenating here. I've not particularly
+        # looked into this deeply because other memory optimizations led to more pronounced reductions.
+        hidden_states = torch.cat(
+            [
+                torch.where(num_times_split > 0, accumulated_split / num_times_split, accumulated_split)
+                for accumulated_split, num_times_split in zip(
+                    accumulated_values.split(self.context_length, dim=1),
+                    num_times_accumulated.split(self.context_length, dim=1),
+                )
+            ],
+            dim=1,
+        ).to(dtype)
+
+        # Flatten frame dimension: [B, FHW, C]
+        hidden_states = hidden_states.flatten(1, 2)
 
         return hidden_states, encoder_hidden_states
 
@@ -426,12 +845,9 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
         emb = self.time_embedding(t_emb, timestep_cond)
 
         # 2. Patch embedding
-        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+        text_seq_length = _get_text_seq_length(encoder_hidden_states)
+        encoder_hidden_states, hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
         hidden_states = self.embedding_dropout(hidden_states)
-
-        text_seq_length = encoder_hidden_states.shape[1]
-        encoder_hidden_states = hidden_states[:, :text_seq_length]
-        hidden_states = hidden_states[:, text_seq_length:]
 
         # 3. Transformer blocks
         for i, block in enumerate(self.transformer_blocks):
@@ -450,6 +866,7 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states,
                     emb,
                     image_rotary_emb,
+                    num_frames,
                     **ckpt_kwargs,
                 )
             else:
@@ -458,6 +875,7 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     temb=emb,
                     image_rotary_emb=image_rotary_emb,
+                    num_frames=num_frames,
                 )
 
         if not self.config.use_rotary_positional_embeddings:
@@ -484,3 +902,13 @@ class CogVideoXTransformer3DModel(ModelMixin, ConfigMixin):
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
+
+
+def _get_text_seq_length(x) -> int:
+    if isinstance(x, torch.Tensor):
+        return x.shape[1]
+    if isinstance(x, list):
+        return _get_text_seq_length(x[0])
+    if isinstance(x, dict):
+        return _get_text_seq_length(next(iter(x.values())))
+    return None
