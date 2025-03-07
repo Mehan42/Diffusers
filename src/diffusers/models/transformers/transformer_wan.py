@@ -440,6 +440,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)
+        shift = shift.to(hidden_states.device)
+        scale = scale.to(hidden_states.device)
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
 
